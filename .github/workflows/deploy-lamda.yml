@@ -1,0 +1,51 @@
+name: Deploy to AWS Lambda (Probot App)
+
+on:
+  push:
+    branches:
+      - main  # Adjust to your branch name if needed
+    paths:
+      - 'probot-app/**'  # Only trigger if there are changes in the probot-app directory
+  pull_request:
+    paths:
+      - 'probot-app/**'  # Only trigger if there are changes in the probot-app directory
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Message for manually triggering'
+        required: false
+        default: 'Triggered for Updates'
+        type: string
+
+jobs:
+  deploy-to-lambda:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Zip deployment package
+      run: |
+        zip -r lambda-deployment.zip . -x '*.git*' -x 'node_modules/.cache/*'
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Deploy to Lambda
+      run: |
+        aws lambda update-function-code \
+          --function-name TEST \
+          --zip-file fileb://lambda-deployment.zip

@@ -20,8 +20,6 @@ on:
       - develop
       - MOSIP*
       - release*
-    paths:
-      - 'probot/**'  # Only trigger if there are changes in the probot directory
 
 jobs:
   build-kafka-producer-docker:
@@ -68,42 +66,3 @@ jobs:
       ACTOR_DOCKER_HUB: ${{ secrets.ACTOR_DOCKER_HUB }}
       RELEASE_DOCKER_HUB: ${{ secrets.RELEASE_DOCKER_HUB }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
-
-  deploy-to-lambda:
-    if: |
-      github.event_name == 'push' && (
-        contains(github.event.head_commit.message, 'probot') || 
-        github.event.pull_request.head.ref == 'probot' || 
-        contains(github.event.head_commit.modified, 'probot')
-      )
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: '18.x'
-    
-    - name: Install dependencies
-      run: npm ci
-    
-    - name: Zip deployment package
-      run: |
-        zip -r lambda-deployment.zip . -x '*.git*' -x 'node_modules/.cache/*'
-    
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1  # Specify your AWS region
-    
-    - name: Deploy to Lambda
-      run: |
-        aws lambda update-function-code \
-          --function-name YOUR_LAMBDA_FUNCTION_NAME \
-          --zip-file fileb://lambda-deployment.zip
-
