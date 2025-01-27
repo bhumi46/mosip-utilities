@@ -3,7 +3,12 @@ name: Deploy to AWS Lambda (Probot App)
 on:
   push:
     branches:
-      - main  # Adjust to your branch name if needed
+      - '!release-branch'
+      - master
+      - 1.*
+      - develop
+      - MOSIP*
+      - release
     paths:
       - 'probot-app/**'  # Only trigger if there are changes in the probot-app directory
   pull_request:
