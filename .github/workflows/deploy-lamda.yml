@@ -58,7 +58,7 @@ jobs:
     
     - name: Deploy to Lambda
       run: |
-        pwd
+        cd probot-app
         aws lambda update-function-code \
           --function-name TEST \
           --zip-file fileb://lambda-deployment.zip
