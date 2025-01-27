@@ -1,19 +1,10 @@
 name: Deploy to AWS Lambda (Probot App)
 
 on:
-  push:
-    branches:
-      - '!release-branch'
-      - master
-      - 1.*
-      - develop
-      - MOSIP*
-      - release
-    paths:
-      - 'probot-app/**'  # Only trigger if there are changes in the probot-app directory
+  release:
+    types: [published]
   pull_request:
-    paths:
-      - 'probot-app/**'  # Only trigger if there are changes in the probot-app directory
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
     inputs:
       message:
@@ -21,6 +12,14 @@ on:
         required: false
         default: 'Triggered for Updates'
         type: string
+  push:
+    branches:
+      - '!release-branch'
+      - master
+      - 1.*
+      - develop
+      - MOSIP*
+      - release*
 
 jobs:
   deploy-to-lambda:
@@ -36,7 +35,8 @@ jobs:
         node-version: '18.x'
     
     - name: Install dependencies
-      run: npm install
+      run: |
+        cd probot-app && npm ci
     
     - name: Zip deployment package
       run: |
