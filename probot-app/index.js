@@ -1,50 +1,51 @@
 import { Octokit } from '@octokit/rest';
-import { WebClient } from '@slack/web-api';
 import axios from 'axios';
 import * as openpgp from 'openpgp';
 
-// Helper functions remain the same
+// Initialize clients outside handler to benefit from warm starts
+const axiosInstance = axios.create({
+  timeout: 5000, // Add timeout to prevent hanging requests
+  headers: { 'Accept-Encoding': 'gzip' } // Enable compression
+});
+
+let octokit;
+
 async function downloadGPGFile(url) {
-  console.debug(`Downloading GPG file from: ${url}`);
-  const response = await axios.get(url, { responseType: 'arraybuffer' });
-  console.debug(`GPG file downloaded successfully`);
-  return new Uint8Array(response.data);
-}
-
-async function decryptGPGData(encryptedData, passphrase) {
-  console.debug(`Decrypting GPG file in memory`);
-  
-  const message = await openpgp.readMessage({
-    binaryMessage: encryptedData
-  });
-
-  const { data: decrypted } = await openpgp.decrypt({
-    message,
-    passwords: [passphrase],
-    format: 'utf8',
-  });
-
-  console.debug(`File decrypted successfully`);
-  return decrypted;
+  try {
+    const response = await axiosInstance.get(url, { 
+      responseType: 'arraybuffer'
+    });
+    return new Uint8Array(response.data);
+  } catch (error) {
+    console.error('GPG file download failed:', error.message);
+    throw error;
+  }
 }
 
 async function getSlackUserId(githubUsername, userMapUrl, userMapPassphrase) {
-  console.debug(`Fetching Slack user ID for GitHub username: ${githubUsername}`);
+  try {
+    const encryptedData = await downloadGPGFile(userMapUrl);
+    const message = await openpgp.readMessage({
+      binaryMessage: encryptedData
+    });
+    
+    const { data: decrypted } = await openpgp.decrypt({
+      message,
+      passwords: [userMapPassphrase],
+      format: 'utf8'
+    });
 
-  const encryptedData = await downloadGPGFile(userMapUrl);
-  const decryptedJson = await decryptGPGData(encryptedData, userMapPassphrase);
-
-  const userMap = JSON.parse(decryptedJson);
-  const slackUserId = userMap[githubUsername];
-
-  console.debug(`Slack user ID for ${githubUsername}: ${slackUserId}`);
-  return slackUserId;
+    const userMap = JSON.parse(decrypted);
+    return userMap[githubUsername];
+  } catch (error) {
+    console.error('Slack user ID lookup failed:', error.message);
+    throw error;
+  }
 }
 
 async function notifySlack(channel, message, slackToken) {
-  console.debug(`Sending Slack notification to channel: ${channel}`);
   try {
-    await axios.post(
+    await axiosInstance.post(
       "https://slack.com/api/chat.postMessage",
       {
         channel,
@@ -59,151 +60,141 @@ async function notifySlack(channel, message, slackToken) {
         },
       }
     );
-    console.debug('Slack notification sent successfully');
   } catch (error) {
-    console.error("Error sending Slack message:", error);
+    console.error('Slack notification failed:', error.message);
     throw error;
   }
 }
 
-// New helper function to get PR details
 async function getPullRequestDetails(owner, repo, commitSha, octokit) {
-  console.debug(`Fetching PR details for commit: ${commitSha}`);
-  const { data: prs } = await octokit.search.issuesAndPullRequests({
-    q: `${commitSha} type:pr repo:${owner}/${repo}`,
-  });
+  try {
+    // Only fetch essential fields to reduce payload size
+    const { data: prs } = await octokit.search.issuesAndPullRequests({
+      q: `${commitSha} type:pr repo:${owner}/${repo}`,
+    });
 
-  if (prs.items.length === 0) {
-    console.debug('No PR found for this commit');
-    return null;
+    if (prs.items.length === 0) return null;
+
+    const prNumber = prs.items[0].number;
+    
+    // Parallelize requests for performance
+    const [prResponse, timelineResponse] = await Promise.all([
+      octokit.pulls.get({
+        owner,
+        repo,
+        pull_number: prNumber,
+      }),
+      octokit.issues.listEventsForTimeline({
+        owner,
+        repo,
+        issue_number: prNumber,
+      })
+    ]);
+
+    const synchronizeEvent = timelineResponse.data
+      .reverse()
+      .find(event => event.event === 'synchronized');
+
+    // Only return necessary fields to reduce memory usage
+    return {
+      number: prResponse.data.number,
+      state: prResponse.data.state,
+      merged: prResponse.data.merged,
+      html_url: prResponse.data.html_url,
+      user: {
+        login: prResponse.data.user.login
+      },
+      isSynchronize: !!synchronizeEvent
+    };
+  } catch (error) {
+    console.error('PR lookup failed:', error.message);
+    throw error;
   }
-
-  const prNumber = prs.items[0].number;
-  const { data: pr } = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number: prNumber,
-  });
-
-  return pr;
 }
 
-// Main Lambda handler
 export const handler = async (event) => {
-  console.log('Lambda handler started');
-  console.log('Event received:', JSON.stringify(event, null, 2));
-
-  // Initialize clients with environment variables
-  const slackToken = process.env.SLACK_TOKEN;
-  const githubToken = process.env.GITHUB_TOKEN;
-  const userMapUrl = process.env.USER_MAP_URL;
-  const userMapPassphrase = process.env.GPG_USER_MAP_PASSPHRASE;
-  const slackCommonChannel = process.env.SLACK_COMMON_CHANNEL;
-  const slackFailureChannel = process.env.SLACK_FAILURE_CHANNEL;
-
-  console.log('Environment variables loaded:', {
-    hasSlackToken: !!slackToken,
-    hasGithubToken: !!githubToken,
-    hasUserMapUrl: !!userMapUrl,
-    hasUserMapPassphrase: !!userMapPassphrase,
-    slackCommonChannel,
-    slackFailureChannel,
-  });
-
-  const octokit = new Octokit({ auth: githubToken });
+  // Initialize Octokit only once per container lifecycle
+  if (!octokit) {
+    octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+  }
 
   try {
-    // Parse the GitHub webhook payload
     const githubEvent = event.headers['X-GitHub-Event'] || event.headers['x-github-event'];
     const payload = JSON.parse(event.body);
     
-    console.log('Processing GitHub webhook:', {
-      eventType: githubEvent,
-      repository: payload.repository?.full_name,
-      action: payload.action,
-    });
-
-    // Handle check suite event
-    if (githubEvent === 'check_suite' && payload.action === 'completed') {
-      const checkSuite = payload.check_suite;
-      const owner = payload.repository.owner.login;
-      const repo = payload.repository.name;
-
-      console.log('Processing check suite event:', {
-        status: checkSuite.status,
-        conclusion: checkSuite.conclusion,
-        headCommit: checkSuite.head_sha,
-      });
-
-      // Only process if the check suite is complete and failed
-      if (checkSuite.status === 'completed' && checkSuite.conclusion === 'failure') {
-        console.log('Failed check suite detected');
-
-        // Get the first failed check from the check suite
-        const { data: checks } = await octokit.checks.listForSuite({
-          owner,
-          repo,
-          check_suite_id: checkSuite.id,
-        });
-
-        const failedCheck = checks.check_runs.find(check => check.conclusion === 'failure');
-        
-        if (failedCheck) {
-          // Get associated PR details
-          const pr = await getPullRequestDetails(owner, repo, checkSuite.head_sha, octokit);
-          
-          if (pr && ['open', 'closed'].includes(pr.state)) {
-            console.log('Associated PR found:', {
-              number: pr.number,
-              state: pr.state,
-              merged: pr.merged,
-            });
-
-            // Handle PR closed/merged case
-            if (pr.state === 'closed') {
-              if (pr.merged && slackFailureChannel) {
-                const message = `🚨 *Build Failure Detected After PR Merge!*\n- *Repository*: ${repo}\n- *Workflow*: ${failedCheck.name}\n- *Failed Checks*: ${failedCheck.html_url}`;
-                await notifySlack(slackFailureChannel, message, slackToken);
-              }
-            }
-            // Handle open PR case
-            else {
-              const slackUserId = await getSlackUserId(pr.user.login, userMapUrl, userMapPassphrase);
-              console.log('Slack user lookup result:', {
-                githubUsername: pr.user.login,
-                slackUserId: slackUserId || 'not found',
-              });
-
-              const message = `🚨 *Build Failure Detected!*\n- *Repository*: ${repo}\n- *Workflow*: ${failedCheck.name}\n- *Commit*: ${checkSuite.head_sha}\n- *Failed Checks*: ${failedCheck.html_url}\n- *PR*: <${pr.html_url}>\nPlease address these issues before merging.`;
-
-              if (slackUserId) {
-                await notifySlack(slackUserId, message, slackToken);
-              } else if (slackCommonChannel) {
-                console.log('User not found in mapping, notifying common channel');
-                const fallbackMessage = `🚨 Build Failure Detected!\nRepository: ${repo}\nWorkflow: ${failedCheck.name}\nCommit: ${checkSuite.head_sha}\nFailed Checks: ${failedCheck.html_url}\nPR: ${pr.html_url}\n(*${pr.user.login}*) not found in user_map.json, notifying the common channel instead.`;
-                await notifySlack(slackCommonChannel, fallbackMessage, slackToken);
-              }
-            }
-          }
-        }
-      }
+    // Early validations in single check
+    if (githubEvent !== 'check_suite' || 
+        payload.action !== 'completed' ||
+        payload.check_suite.status !== 'completed' || 
+        payload.check_suite.conclusion !== 'failure') {
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ message: 'Event ignored' })
+      };
     }
 
-    console.log('Webhook processed successfully');
+    const checkSuite = payload.check_suite;
+    const { owner: { login: owner }, name: repo } = payload.repository;
+
+    // Parallelize initial API calls
+    const [checksResponse, pr] = await Promise.all([
+      octokit.checks.listForSuite({
+        owner,
+        repo,
+        check_suite_id: checkSuite.id,
+      }),
+      getPullRequestDetails(owner, repo, checkSuite.head_sha, octokit)
+    ]);
+
+    const failedCheck = checksResponse.data.check_runs.find(check => 
+      check.conclusion === 'failure'
+    );
+    
+    if (!failedCheck || !pr || !['open', 'closed'].includes(pr.state)) {
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ message: 'No action required' })
+      };
+    }
+
+    // Prepare notification content
+    const { SLACK_TOKEN, USER_MAP_URL, GPG_USER_MAP_PASSPHRASE, 
+            SLACK_COMMON_CHANNEL, SLACK_FAILURE_CHANNEL } = process.env;
+
+    // Construct base message once
+    const baseMessage = `*Repo*: ${repo}\n*Workflow*: ${failedCheck.name}\n*Checks*: ${failedCheck.html_url}`;
+
+    if (pr.state === 'closed' && pr.merged && SLACK_FAILURE_CHANNEL) {
+      await notifySlack(
+        SLACK_FAILURE_CHANNEL, 
+        `🚨 *Build Failure After Merge*\n${baseMessage}`, 
+        SLACK_TOKEN
+      );
+    } else {
+      const slackUserId = await getSlackUserId(
+        pr.user.login, 
+        USER_MAP_URL, 
+        GPG_USER_MAP_PASSPHRASE
+      );
+
+      const message = `${pr.isSynchronize ? '🔄' : '🚨'} *Build Failure${pr.isSynchronize ? ' - Updated PR' : ''}*\n${baseMessage}\n*PR*: ${pr.html_url}`;
+      
+      await notifySlack(
+        slackUserId || SLACK_COMMON_CHANNEL,
+        slackUserId ? message : `${message}\n(*${pr.user.login}* not found in user map)`,
+        SLACK_TOKEN
+      );
+    }
+
     return {
       statusCode: 200,
-      body: JSON.stringify({ message: 'Webhook processed successfully' }),
+      body: JSON.stringify({ message: 'Webhook processed successfully' })
     };
   } catch (error) {
-    console.error('Error processing webhook:', error.stack);
-    console.error('Error details:', {
-      name: error.name,
-      message: error.message,
-      code: error.code,
-    });
+    console.error('Processing failed:', error);
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Internal server error' }),
+      body: JSON.stringify({ error: 'Internal server error' })
     };
   }
 };
