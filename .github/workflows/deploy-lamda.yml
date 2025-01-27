@@ -40,7 +40,8 @@ jobs:
     
     - name: Zip deployment package
       run: |
-        zip -r lambda-deployment.zip . -x '*.git*' -x 'node_modules/.cache/*'
+        pwd
+        zip -r lambda-deployment.zip index.js node_modules package-lock.json package.json
     
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
