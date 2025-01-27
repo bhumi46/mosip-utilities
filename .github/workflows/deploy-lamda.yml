@@ -40,6 +40,7 @@ jobs:
     
     - name: Zip deployment package
       run: |
+        cd probot-app
         pwd
         zip -r lambda-deployment.zip index.js node_modules package-lock.json package.json
     
